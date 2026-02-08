@@ -222,11 +222,13 @@ class RegionalAttnProcessor2_0:
 
         # Add identity-specific contributions weighted by masks
         for identity_idx, id_output in enumerate(identity_outputs):
-            # Get mask for this identity: (1, h*w)
-            mask = masks_flat[identity_idx:identity_idx+1, :]
+            # Get mask for this identity: (h*w,)
+            mask = masks_flat[identity_idx]
 
             # Expand mask for broadcasting: (batch, h*w, 1)
-            mask_expanded = mask.unsqueeze(0).expand(batch_size, -1, 1)
+            # mask shape: (h*w,) -> unsqueeze(0): (1, h*w) -> unsqueeze(-1): (1, h*w, 1)
+            # -> expand: (batch_size, h*w, 1)
+            mask_expanded = mask.unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, -1)
             mask_expanded = mask_expanded.to(id_output.dtype)
 
             # Weight identity contribution by mask
