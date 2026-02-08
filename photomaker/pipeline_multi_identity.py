@@ -61,11 +61,32 @@ class PhotoMakerMultiIdentityPipeline(PhotoMakerStableDiffusionXLPipeline):
         )
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.prompt_parser = MultiIdentityPromptParser()
-        self.face_detector = None
-        self._original_attn_processors = None
+    # Don't override __init__ - use lazy initialization for custom attributes
+    # This allows from_pretrained() to work correctly
+
+    @property
+    def prompt_parser(self):
+        """Lazy initialization of prompt parser"""
+        if not hasattr(self, '_prompt_parser') or self._prompt_parser is None:
+            self._prompt_parser = MultiIdentityPromptParser()
+        return self._prompt_parser
+
+    @property
+    def face_detector(self):
+        """Face detector (must be initialized with setup_face_detector)"""
+        return getattr(self, '_face_detector', None)
+
+    @face_detector.setter
+    def face_detector(self, value):
+        self._face_detector = value
+
+    @property
+    def _original_attn_processors(self):
+        return getattr(self, '_orig_attn_procs', None)
+
+    @_original_attn_processors.setter
+    def _original_attn_processors(self, value):
+        self._orig_attn_procs = value
 
     def setup_face_detector(self, device: str = "cuda"):
         """Initialize face detector for bbox extraction"""
