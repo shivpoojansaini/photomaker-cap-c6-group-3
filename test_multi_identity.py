@@ -161,49 +161,78 @@ def test_full_pipeline(
     left_image_path: str = None,
     right_image_path: str = None,
     output_path: str = "output_multi_identity.png",
+    prompt: str = None,
 ):
     """
     Full pipeline test with actual model loading and generation.
 
-    This test requires:
-    - SDXL model weights
-    - PhotoMaker adapter weights
-    - Test images
+    Uses default model paths from original PhotoMaker code:
+    - Base model: SG161222/RealVisXL_V4.0
+    - PhotoMaker: TencentARC/PhotoMaker-V2
     """
     print("\nTesting full pipeline...")
 
-    if model_path is None:
-        print("  [SKIP] No model path provided. Use --model_path to run full test.")
+    if input_image_path is None:
+        print("  [SKIP] No input image provided. Use --input_image to run full test.")
         return True
 
     try:
+        import os
         from photomaker import PhotoMakerMultiIdentityPipeline
         from diffusers import EulerDiscreteScheduler
+        from huggingface_hub import hf_hub_download
 
-        print(f"  Loading model from {model_path}...")
+        # Default model paths (same as original PhotoMaker code)
+        if model_path is None:
+            model_path = "SG161222/RealVisXL_V4.0"
+        if photomaker_path is None:
+            photomaker_path = "TencentARC/PhotoMaker-V2"
+
+        # Default prompt
+        if prompt is None:
+            prompt = "left person as astronaut in space suit, right person as doctor in white coat"
+
+        # Determine device and dtype
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        torch_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+        print(f"  Device: {device}, dtype: {torch_dtype}")
+        print(f"  Loading base model: {model_path}")
 
         # Load pipeline
         pipe = PhotoMakerMultiIdentityPipeline.from_pretrained(
             model_path,
-            torch_dtype=torch.float16,
+            torch_dtype=torch_dtype,
             use_safetensors=True,
-        ).to("cuda")
+            variant="fp16",
+        ).to(device)
 
         # Load scheduler
         pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
 
-        # Load PhotoMaker adapter
-        if photomaker_path:
-            print(f"  Loading PhotoMaker adapter from {photomaker_path}...")
-            pipe.load_photomaker_adapter(
-                photomaker_path,
-                weight_name="photomaker-v2.bin",
-                trigger_word="img",
-            )
+        # Download and load PhotoMaker adapter
+        print(f"  Downloading PhotoMaker adapter: {photomaker_path}")
+        ckpt = hf_hub_download(
+            repo_id=photomaker_path,
+            filename="photomaker-v2.bin",
+            repo_type="model"
+        )
+
+        pipe.load_photomaker_adapter(
+            os.path.dirname(ckpt),
+            subfolder="",
+            weight_name=os.path.basename(ckpt),
+            trigger_word="img",
+            pm_version="v2",
+        )
+
+        pipe.id_encoder.to(device)
 
         # Setup face detector
         print("  Setting up face detector...")
-        pipe.setup_face_detector(device="cuda")
+        pipe.setup_face_detector(device=device)
+
+        print(f"  Prompt: {prompt}")
 
         # Option 1: Single image with 2 people (SIMPLER)
         if input_image_path:
@@ -212,7 +241,7 @@ def test_full_pipeline(
 
             result = pipe.generate_from_single_image(
                 input_image=input_image,
-                prompt="left person as astronaut in space suit, right person as doctor in white coat",
+                prompt=prompt,
                 num_inference_steps=30,
                 guidance_scale=5.0,
                 start_merge_step=10,
@@ -229,7 +258,7 @@ def test_full_pipeline(
             right_images = [Image.open(right_image_path).convert("RGB")]
 
             result = pipe(
-                prompt="left person as astronaut in space suit, right person as doctor in white coat",
+                prompt=prompt,
                 identity_images=[left_images, right_images],
                 regional_positions=["left", "right"],
                 num_inference_steps=30,
@@ -253,12 +282,13 @@ def test_full_pipeline(
 
 def main():
     parser = argparse.ArgumentParser(description="Test Multi-Identity PhotoMaker Pipeline")
-    parser.add_argument("--model_path", type=str, help="Path to SDXL model")
-    parser.add_argument("--photomaker_path", type=str, help="Path to PhotoMaker adapter")
-    parser.add_argument("--input_image", type=str, help="Path to single image with 2 people (RECOMMENDED)")
-    parser.add_argument("--left_image", type=str, help="Path to left person's image (alternative)")
-    parser.add_argument("--right_image", type=str, help="Path to right person's image (alternative)")
+    parser.add_argument("--input_image", type=str, help="Path to single image with 2 people (REQUIRED)")
+    parser.add_argument("--prompt", type=str, help="Prompt like 'left person as X, right person as Y'")
     parser.add_argument("--output", type=str, default="output_multi_identity.png", help="Output path")
+    parser.add_argument("--model_path", type=str, default=None, help="Base model (default: SG161222/RealVisXL_V4.0)")
+    parser.add_argument("--photomaker_path", type=str, default=None, help="PhotoMaker adapter (default: TencentARC/PhotoMaker-V2)")
+    parser.add_argument("--left_image", type=str, help="Path to left person's image (alternative to --input_image)")
+    parser.add_argument("--right_image", type=str, help="Path to right person's image (alternative to --input_image)")
     parser.add_argument("--full_test", action="store_true", help="Run full pipeline test")
 
     args = parser.parse_args()
@@ -275,8 +305,8 @@ def main():
     results.append(("Spatial Masks", test_spatial_masks()))
     results.append(("Regional Attention", test_regional_attention()))
 
-    # Run full pipeline test if requested
-    if args.full_test or args.model_path:
+    # Run full pipeline test if requested (triggered by --input_image or --full_test)
+    if args.full_test or args.input_image or args.left_image:
         results.append(("Full Pipeline", test_full_pipeline(
             model_path=args.model_path,
             photomaker_path=args.photomaker_path,
@@ -284,6 +314,7 @@ def main():
             left_image_path=args.left_image,
             right_image_path=args.right_image,
             output_path=args.output,
+            prompt=args.prompt,
         )))
 
     # Summary
