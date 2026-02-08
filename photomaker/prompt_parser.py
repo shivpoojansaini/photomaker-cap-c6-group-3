@@ -44,7 +44,11 @@ class MultiIdentityPromptParser:
     PERSON_KEYWORDS = ['person', 'man', 'woman', 'guy', 'girl', 'individual', 'one']
 
     # Connector keywords between position and description
-    CONNECTOR_KEYWORDS = ['as', 'is', 'wearing', 'dressed as', 'in', 'as a', 'is a']
+    CONNECTOR_KEYWORDS = [
+        'as', 'is', 'wearing', 'dressed as', 'in', 'as a', 'is a',
+        'with', 'having', 'change', 'changing', 'becomes', 'turned into',
+        'transformed into', 'looking like', 'dressed like'
+    ]
 
     def __init__(self, trigger_word: str = "img"):
         self.trigger_word = trigger_word
@@ -146,8 +150,12 @@ class MultiIdentityPromptParser:
                     ))
 
         # Fallback: split by comma and assign left/right
-        if not regions:
-            regions = self._parse_comma_separated(prompt, num_identities)
+        # Also use fallback if we found fewer regions than expected
+        if not regions or len(regions) < num_identities:
+            comma_regions = self._parse_comma_separated(prompt, num_identities)
+            # Use comma parsing if it found more regions
+            if len(comma_regions) > len(regions):
+                regions = comma_regions
 
         # Extract shared context
         shared_context = self._extract_shared_context(prompt, regions)
