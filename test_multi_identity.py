@@ -62,6 +62,9 @@ def test_prompt_parser():
             print(f"  [OK] '{prompt[:40]}...' -> {len(result.regions)} regions")
             for r in result.regions:
                 print(f"       - {r.region_id}: '{r.description[:30]}...'")
+            # Also show composition prompt
+            comp_prompt = parser.get_composition_prompt(result)
+            print(f"       Composition: '{comp_prompt[:60]}...'")
         else:
             print(f"  [FAIL] '{prompt[:40]}...' -> expected {expected_regions}, got {len(result.regions)}")
             all_passed = False

@@ -164,6 +164,8 @@ class PhotoMakerMultiIdentityPipeline(PhotoMakerStableDiffusionXLPipeline):
         bbox_right = tuple(faces_sorted[1]['bbox'])
 
         # Call main pipeline with extracted data
+        # Note: Disable regional attention for now - relying on composition prompt
+        # to guide placement of identities
         return self(
             prompt=prompt,
             height=height,
@@ -179,6 +181,7 @@ class PhotoMakerMultiIdentityPipeline(PhotoMakerStableDiffusionXLPipeline):
             identity_embeds=[embed_left.unsqueeze(0), embed_right.unsqueeze(0)],
             regional_positions=["left", "right"],
             face_bboxes=[bbox_left, bbox_right],
+            enable_regional_attention=False,  # Disable for now, test basic fusion
             **kwargs,
         )
 
@@ -281,10 +284,17 @@ class PhotoMakerMultiIdentityPipeline(PhotoMakerStableDiffusionXLPipeline):
             id_pixel_values_list.append(pixel_values)
 
             # Get embeddings
+            num_imgs = len(images)
             if identity_embeds is not None and idx < len(identity_embeds):
                 embeds = identity_embeds[idx]
+                # Ensure shape is [1, num_imgs, embed_dim] to match pixel_values shape
                 if embeds.dim() == 1:
-                    embeds = embeds.unsqueeze(0)
+                    embeds = embeds.unsqueeze(0).unsqueeze(0)  # [512] -> [1, 1, 512]
+                elif embeds.dim() == 2:
+                    embeds = embeds.unsqueeze(0)  # [num_imgs, 512] -> [1, num_imgs, 512]
+                # If only one embedding but multiple images, repeat it
+                if embeds.shape[1] < num_imgs:
+                    embeds = embeds.repeat(1, num_imgs, 1)
                 id_embeds_list.append(embeds.to(device=device, dtype=dtype))
             else:
                 # Extract embeddings from images
@@ -500,68 +510,69 @@ class PhotoMakerMultiIdentityPipeline(PhotoMakerStableDiffusionXLPipeline):
             if self.cross_attention_kwargs is not None else None
         )
 
-        # Use first identity's prompt for base encoding
-        base_prompt = identity_prompts[0]
-        num_id_images = len(identity_images[0])
+        # Generate composition prompt that tells model to create multiple people
+        # This is critical - without it, the model generates only one person
+        parsed = self.prompt_parser.parse(prompt)
+        composition_prompt = self.prompt_parser.get_composition_prompt(parsed)
+
+        # Use composition prompt for base encoding (contains both identities)
+        # This ensures SDXL generates a multi-person scene
+        base_prompt = composition_prompt if composition_prompt else identity_prompts[0]
+
+        # Count total ID images across all identities
+        total_id_images = sum(len(imgs) for imgs in identity_images)
+
+        print(f"  Composition prompt: {base_prompt}")
+        print(f"  Total ID images: {total_id_images}")
 
         (
             prompt_embeds_base,
             _,
             pooled_prompt_embeds,
             _,
-            class_tokens_mask_base,
+            class_tokens_mask,
         ) = self.encode_prompt_with_trigger_word(
             prompt=base_prompt,
             prompt_2=prompt_2,
             device=device,
-            num_id_images=num_id_images,
+            num_id_images=total_id_images,  # Total images for ALL identities
             num_images_per_prompt=num_images_per_prompt,
             do_classifier_free_guidance=False,  # Handle CFG separately
             lora_scale=lora_scale,
             clip_skip=self.clip_skip,
         )
 
-        # Process each identity through ID encoder
-        processed_id_embeds = []
-        for idx, (id_pixel_values, id_embeds_single) in enumerate(zip(id_pixel_values_list, id_embeds_list)):
-            b, num_inputs, c, h, w = id_pixel_values.shape
-            id_pixel_values_flat = id_pixel_values.view(b * num_inputs, c, h, w)
+        # Stack all ID pixel values and embeddings from all identities
+        all_id_pixel_values = torch.cat(id_pixel_values_list, dim=1)  # [b, total_imgs, c, h, w]
+        all_id_embeds = torch.cat(id_embeds_list, dim=1)  # [b, total_imgs, embed_dim]
 
-            # CLIP vision features
-            last_hidden_state = self.id_encoder.vision_model(id_pixel_values_flat)[0]
+        # Use the full id_encoder to properly FUSE identities into prompt embeddings
+        # This is critical - it calls fuse_module which merges ID info into the prompt
+        combined_prompt_embeds = self.id_encoder(
+            all_id_pixel_values,
+            prompt_embeds_base,
+            class_tokens_mask,
+            all_id_embeds
+        )
 
-            # Prepare embeddings
-            id_embeds_flat = id_embeds_single.view(b * num_inputs, -1)
-
-            # QFormer perceiver
-            id_embeds_processed = self.id_encoder.qformer_perceiver(id_embeds_flat, last_hidden_state)
-            id_embeds_processed = id_embeds_processed.view(b, num_inputs, self.num_tokens, -1)
-
-            processed_id_embeds.append(id_embeds_processed)
-
-        # Combine identity tokens with base prompt
-        # Layout: [base_prompt (77)] + [id1_tokens] + [id2_tokens] + ...
-        all_id_tokens = []
+        # Track token ranges for regional attention
+        # After fusion, the class tokens are replaced with fused ID tokens
+        # Each identity contributes num_tokens tokens at the class token positions
         token_ranges = {}
-        current_pos = prompt_embeds_base.shape[1]  # 77
+        class_token_start = class_tokens_mask[0].nonzero(as_tuple=True)[0][0].item()
 
-        for idx, id_embeds in enumerate(processed_id_embeds):
-            # Take first image's tokens
-            id_tokens = id_embeds[:, 0, :, :]  # (batch, num_tokens, embed_dim)
-            all_id_tokens.append(id_tokens)
+        for idx in range(num_identities):
+            start_pos = class_token_start + idx * self.num_tokens
+            end_pos = start_pos + self.num_tokens
+            token_ranges[idx] = (start_pos, end_pos)
 
-            num_tokens = id_tokens.shape[1]
-            token_ranges[idx] = (current_pos, current_pos + num_tokens)
-            current_pos += num_tokens
-
-        # Concatenate
-        combined_prompt_embeds = torch.cat([prompt_embeds_base] + all_id_tokens, dim=1)
+        print(f"  Token ranges: {token_ranges}")
 
         # Prepare text-only embeddings for delayed conditioning
+        # Remove ALL trigger word tokens (there may be multiple for multi-identity)
         tokens_text_only = self.tokenizer.encode(base_prompt, add_special_tokens=False)
         trigger_word_token = self.tokenizer.convert_tokens_to_ids(self.trigger_word)
-        if trigger_word_token in tokens_text_only:
-            tokens_text_only.remove(trigger_word_token)
+        tokens_text_only = [t for t in tokens_text_only if t != trigger_word_token]
         prompt_text_only = self.tokenizer.decode(tokens_text_only, add_special_tokens=False)
 
         (

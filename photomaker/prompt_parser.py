@@ -272,6 +272,70 @@ class MultiIdentityPromptParser:
         return prompts
 
 
+    def get_composition_prompt(
+        self,
+        parsed: ParsedMultiPrompt,
+        include_single_trigger: bool = True,
+    ) -> str:
+        """
+        Generate a combined composition prompt that tells the model to generate multiple people.
+
+        This is critical for multi-identity generation - without a composition prompt,
+        the model will only generate one person.
+
+        IMPORTANT: PhotoMaker only supports ONE trigger word per prompt. This method
+        creates a scene composition prompt with a single "img" placeholder. The identity
+        tokens for each person are appended separately via regional attention.
+
+        Args:
+            parsed: Parsed multi-prompt result
+            include_single_trigger: Include one trigger word for ID embedding (required)
+
+        Returns:
+            Combined prompt like "Two people img, a teacher on the left and a doctor on the right"
+        """
+        num_people = len(parsed.regions)
+
+        if num_people == 0:
+            return ""
+
+        if num_people == 1:
+            return parsed.regions[0].description
+
+        # Build composition prompt - remove trigger words from individual descriptions
+        # since we'll have ONE trigger word for the shared embedding
+        people_word = "Two people" if num_people == 2 else f"{num_people} people"
+
+        descriptions = []
+        for region in parsed.regions:
+            # Remove trigger word from description to avoid multiple triggers
+            desc = region.description
+            desc = desc.replace(f" {self.trigger_word} ", " ").replace(f" {self.trigger_word}", "")
+            # Clean up any double spaces
+            desc = " ".join(desc.split())
+
+            position = region.spatial_hint
+            descriptions.append(f"a {desc} on the {position}")
+
+        # Combine with proper grammar
+        if len(descriptions) == 2:
+            combined_desc = f"{descriptions[0]} and {descriptions[1]}"
+        else:
+            combined_desc = ", ".join(descriptions[:-1]) + f", and {descriptions[-1]}"
+
+        # Single trigger word for the people token - identity embeddings are appended separately
+        if include_single_trigger:
+            composition = f"{people_word} {self.trigger_word}, {combined_desc}"
+        else:
+            composition = f"{people_word}, {combined_desc}"
+
+        # Add shared context if present
+        if parsed.shared_context:
+            composition = f"{composition}, {parsed.shared_context}"
+
+        return composition
+
+
 # Convenience function
 def parse_multi_identity_prompt(
     prompt: str,
